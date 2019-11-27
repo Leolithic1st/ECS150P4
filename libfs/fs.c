@@ -59,9 +59,10 @@ static uint32_t g_FATLen = 0;
 static FAT_Info g_FATInfo = {0};
 static Root_Dir_Info g_rootDirInfo = {0};
 static All_Data_Block g_all_data = {0};
-static uint16_t g_fileNumTotal = 0;
+uint16_t g_fileNumTotal = 0;
 static File_Des* g_openedFiles[FS_OPEN_MAX_COUNT] = {0};
 static uint16_t g_openedFileNum = 0;
+static int8_t g_mounted_flag = 0;
 
 
 static uint16_t _get_fs_file_num(void)
@@ -101,7 +102,7 @@ static int16_t _find_openedFile_by_fd(File_Des* fd)
 static int16_t _find_openedFile_by_name(const char* filename)
 {
     File_Des* fd = NULL;
-    for(uint16_t idx = 0; idx < FS_FILE_MAX_COUNT; ++idx){
+    for(uint16_t idx = 0; idx < FS_OPEN_MAX_COUNT; ++idx){
         fd = g_openedFiles[idx];
         if(NULL != fd){
             if(0 == strncmp(filename, (g_rootDirInfo.files[fd->idx]).filename, strlen(filename))){
@@ -186,6 +187,11 @@ static int32_t _find_empty_FAT(void)
 int fs_mount(const char *diskname)
 {
 //    printf("%s\n", __FUNCTION__);
+    if(0 != g_mounted_flag){
+        //has mounted
+        return -1;
+    }
+
     int mnt_ret = block_disk_open(diskname);
     if (0 != mnt_ret)
     {
@@ -198,6 +204,8 @@ int fs_mount(const char *diskname)
         if(-1 == block_read(0, &g_superBlockInfo)){
             return -1;
         }
+
+        //fs_info();
 
         //check signature
         if(0 != strncmp(DEFAULT_SIGN, g_superBlockInfo.sign, strlen(DEFAULT_SIGN))){
@@ -264,6 +272,7 @@ int fs_mount(const char *diskname)
         }
 
         g_fileNumTotal = _get_fs_file_num();
+        g_mounted_flag = 1;
     }
 
     return 0;
@@ -272,7 +281,13 @@ int fs_mount(const char *diskname)
 int fs_umount(void)
 {
 //    printf("%s\n", __FUNCTION__);
-    //check?
+    if(0 != g_openedFileNum){
+        return -1;
+    }
+
+    if(1 != g_mounted_flag){
+        return -1;
+    }
 
     //write super block
     if( -1 == block_write(0, &g_superBlockInfo) ){
@@ -286,6 +301,7 @@ int fs_umount(void)
             return -1;
         }
     }
+    free(g_FATInfo.data);
 
     //write root dir
     if( -1 == block_write(g_superBlockInfo.fat_block_num+1, &g_rootDirInfo) ){
@@ -298,9 +314,17 @@ int fs_umount(void)
                     g_all_data.data_all[cnt]) ){
             return -1;
         }
+        free(g_all_data.data_all[cnt]);
+    }
+    free(g_all_data.data_all);
+
+    int close_ret = block_disk_close();
+    if(-1 == close_ret){
+        return -1;
     }
 
-    return block_disk_close();
+    g_mounted_flag = 0;
+    return close_ret;
 }
 
 int fs_info(void)
@@ -369,8 +393,10 @@ int fs_delete(const char *filename)
     //clear FAT
     uint16_t tmp = 0;
     uint16_t next_idx = g_rootDirInfo.files[file_idx].start_data_block_idx;
-    //delete file content>?? TODO
-    while(FAT_EOC != g_FATInfo.data[next_idx]){
+    while(FAT_EOC != next_idx){
+        //clear data content
+        memset(g_all_data.data_all[next_idx]->data, 0, BLOCK_SIZE);
+
         tmp = next_idx;
         next_idx = g_FATInfo.data[next_idx];
         g_FATInfo.data[tmp] = FAT_EOC;
@@ -379,7 +405,7 @@ int fs_delete(const char *filename)
     //delete
     memset(g_rootDirInfo.files[file_idx].filename, 0, FS_FILENAME_LEN);
     g_rootDirInfo.files[file_idx].file_size = 0;
-    g_rootDirInfo.files[file_idx].start_data_block_idx = FAT_EOC;
+    g_rootDirInfo.files[file_idx].start_data_block_idx = 0;
 
     g_fileNumTotal--;
     return 0;
@@ -486,11 +512,11 @@ int fs_lseek(int fd, size_t offset)
     }
 
     uint32_t file_size = g_rootDirInfo.files[fDes->idx].file_size;
-    if( (offset+fDes->offset) > file_size ){
+    if(offset > file_size){
         return -1;
     }
 
-    fDes->offset += offset;
+    fDes->offset = offset;
     return 0;
 }
 
@@ -532,17 +558,22 @@ int fs_write(int fd, void *buf, size_t count)
     if(BLOCK_SIZE < (fDes->offset+write_len)){
         uint16_t block_step = (fDes->offset+write_len)/BLOCK_SIZE;
         uint32_t remain_len = (fDes->offset+write_len)%BLOCK_SIZE;
+        uint16_t offset_of_first_block = fDes->offset%BLOCK_SIZE;
+        if(0 == remain_len){
+            remain_len = BLOCK_SIZE;
+        }
 
         //data in first block
         block_read(start_block_idx, tmp_buf);
-        memcpy(tmp_buf+fDes->offset, buf, BLOCK_SIZE-fDes->offset);
+        memcpy(tmp_buf+offset_of_first_block, buf, BLOCK_SIZE-offset_of_first_block);
         block_write(start_block_idx, tmp_buf);
-        write_cnt += BLOCK_SIZE-fDes->offset;
+        write_cnt = BLOCK_SIZE-offset_of_first_block;
 
         //data in middle blocks
         uint16_t old_block_idx = start_block_idx;
         uint16_t block_idx = g_FATInfo.data[old_block_idx];
-        for(uint16_t cnt = 0; cnt < block_step; ++cnt){
+        //skip first and last block, so -2
+        for(uint16_t cnt = 2; cnt < block_step; ++cnt){
             if(FAT_EOC == block_idx){
                 block_idx = _find_empty_FAT();
                 g_FATInfo.data[old_block_idx] = block_idx;
@@ -553,11 +584,10 @@ int fs_write(int fd, void *buf, size_t count)
             block_write(block_idx, tmp_buf);
             write_cnt += BLOCK_SIZE;
             old_block_idx = block_idx;
-            block_idx = g_FATInfo.data[block_idx];
+            block_idx = g_FATInfo.data[old_block_idx];
         }
 
         //data in last block
-        block_idx = g_FATInfo.data[block_idx];
         if(FAT_EOC == block_idx){
             block_idx = _find_empty_FAT();
             g_FATInfo.data[old_block_idx] = block_idx;
@@ -576,6 +606,7 @@ int fs_write(int fd, void *buf, size_t count)
     }
 
     pFE->file_size += add_len;
+    //printf("filesize(%d), addlen(%d), wc(%d)\n", pFE->file_size, add_len, write_cnt);
     fDes->offset += write_cnt;
     return write_cnt;
 }
@@ -607,15 +638,21 @@ int fs_read(int fd, void *buf, size_t count)
     if(BLOCK_SIZE < (fDes->offset+read_len)){
         uint16_t block_step = (fDes->offset+read_len)/BLOCK_SIZE;
         uint32_t remain_len = (fDes->offset+read_len)%BLOCK_SIZE;
+        uint16_t offset_of_first_block = fDes->offset%BLOCK_SIZE;
+        //printf("alllen(%d), step(%d), remain(%d)\n", (fDes->offset+read_len), block_step, remain_len);
+        if(0 == remain_len){
+            remain_len = BLOCK_SIZE;
+        }
 
         //data in first block
         block_read(start_block_idx, tmp_buf);
-        memcpy(buf, tmp_buf+fDes->offset, BLOCK_SIZE-fDes->offset);
-        read_cnt += BLOCK_SIZE-fDes->offset;
+        memcpy(buf, tmp_buf+offset_of_first_block, BLOCK_SIZE-offset_of_first_block);
+        read_cnt += BLOCK_SIZE-offset_of_first_block;
 
         //data in middle blocks
         uint16_t block_idx = g_FATInfo.data[start_block_idx];
-        for(uint16_t cnt = 0; cnt < block_step; ++cnt){
+        //skip first and last block, so -2
+        for(uint16_t cnt = 2; cnt < block_step; ++cnt){
             if(FAT_EOC != block_idx){
                 block_read(block_idx, tmp_buf);
                 memcpy(buf+read_cnt, tmp_buf, BLOCK_SIZE);
@@ -636,6 +673,7 @@ int fs_read(int fd, void *buf, size_t count)
         read_cnt += read_len;
     }
 
+    //printf("filesize(%d), rc(%d)\n", pFE->file_size, read_cnt);
     fDes->offset += read_cnt;
     return read_cnt;
 }
